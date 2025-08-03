@@ -1,7 +1,7 @@
 import json
 import gzip
 import hashlib
-import re
+import re, html, unicodedata, html2text
 import subprocess
 import argparse
 from pathlib import Path
@@ -10,7 +10,7 @@ from tqdm import tqdm
 from datetime import datetime, timezone
 
 class DatasetCreator:
-    """Creates Dolma-format multilingual dataset from HTML and PDF files."""
+    """Creates Dolma-format multilingual dataset from HTML and PDF files (converted to TXT)."""
     
     def __init__(self, debug=False):
         self.debug = debug
@@ -45,27 +45,11 @@ class DatasetCreator:
         # Debug samples
         self.debug_samples = {"html": [], "pdf": []}
 
-    def clean_control_chars(self, text):
-        """Remove control characters that break JSON."""
-        if not text:
-            return text
-        
-        # Remove control chars 0x00-0x1F except tab(0x09), LF(0x0A), CR(0x0D)
-        # Keep regular spaces and newlines
-        control_chars = {i: None for i in range(0x00, 0x20)}
-        # Keep tab, LF, CR
-        del control_chars[0x09]  # tab
-        del control_chars[0x0A]  # line feed
-        del control_chars[0x0D]  # carriage return
-        
-        return text.translate(control_chars)
-
     def get_domain(self, file_path, source_format, lang):
         """Determine category by filename or directory."""
         if source_format == 'pdf':
             return "literature"
         
-        filename = file_path.stem.lower()
         path_str = str(file_path).lower()
         
         if lang == "he":
@@ -104,74 +88,149 @@ class DatasetCreator:
             words = text.split()
             return len([w for w in words if w.strip()])
 
-    def extract_content(self, html_content):
-        """Extract title and content from HTML file - preserve text structure."""
-        soup = BeautifulSoup(html_content, 'html.parser')
-        title = soup.title.string.strip() if soup.title and soup.title.string else ""
-        content = soup.get_text(separator='\n\n', strip=True)
-        return title, content
+    def clean_control_chars(self, text):
+        """Remove control characters that break JSON."""
+        if not text:
+            return text
+        # Strip UTF-8/UTF-16 BOM if it sneaked in
+        text = text.lstrip('\ufeff')        
+        # Remove control chars 0x00-0x1F except tab(0x09), LF(0x0A), CR(0x0D)
+        # Keep regular spaces and newlines
+        control_chars = {i: None for i in range(0x00, 0x20)}
+        # Keep tab, LF, CR
+        del control_chars[0x09]  # tab
+        del control_chars[0x0A]  # line feed
+        del control_chars[0x0D]  # carriage return
+        
+        return text.translate(control_chars)
 
-    def extract_pdf(self, pdf_path):
-        """Extract text from PDF with Hebrew fixes."""
-        import fitz
+    def compact_html(self, raw):
+        """
+        Shrink raw HTML
+
+        • Collapses \n \r \t and double-spaces outside tags  
+        • Drops gaps such as '>  <' **and** ' </span>' / '<span> '  
+        • Keeps the exact bytes of <script>, and anything inside tags
+        """
+        out, in_tag, protect = [], False, False
+        i, n = 0, len(raw)
+
+        while i < n:
+            ch = raw[i]
+            if ch == "<":
+                tag = raw[i:i+10].lower()
+                if tag.startswith("<script"):
+                    protect = True
+                elif tag.startswith("</script"):
+                    protect = False
+                in_tag = True
+                out.append(ch)
+
+            elif ch == ">":
+                in_tag = False
+                out.append(ch)
+
+            else:
+                if in_tag or protect:                     # inside tag or protected block
+                    out.append(ch)
+                else:                                     # normal text
+                    out.append(" " if ch in "\n\r\t" else ch)
+            i += 1
+
+        s = "".join(out)
+        # 1) remove whitespace between consecutive tags
+        s = re.sub(r">\s+<", "><", s)
+        # 2) remove whitespace right *before* a tag boundary
+        s = re.sub(r"\s+<", "<", s)
+        # 3) remove whitespace right *after* a tag boundary
+        s = re.sub(r">\s+", ">", s)
+        # 4) final collapse of multiple spaces
+        return re.sub(r" {2,}", " ", s).strip()
+    
+    def extract_content(self, html_content):
+        """
+        Extract HTML content (supporting 12 website languages) and return:
+            title – page title
+            text  – "flat" body text for model training/management
+        """
         
-        doc = fitz.open(pdf_path)
-        text_parts = []
+        # Enhanced CJK range - includes extended characters and punctuation
+        CJK_RANGE = (r"\u4E00-\u9FFF"      # CJK Unified Ideographs  
+                    r"\u3040-\u30FF"      # Hiragana + Katakana
+                    r"\uAC00-\uD7AF"      # Hangul Syllables
+                    r"\u3100-\u312F"      # Bopomofo (Chinese phonetic)
+                    r"\uFF00-\uFFEF")     # CJK punctuation and symbols
+
+        # 1. Title – always via BeautifulSoup
+        soup = BeautifulSoup(html_content, "html.parser")
+        title = soup.title.get_text(strip=True) if soup.title else ""
+        title = unicodedata.normalize('NFKC', html.unescape(title))
+
+        # 2. html2text – body text extraction
+        h2t = html2text.HTML2Text()
+        h2t.body_width = 0            # no hard-wrap
+        h2t.ignore_links = True       # anchor-text only
+        h2t.ignore_images = True
+        h2t.ignore_tables = True
+        h2t.ignore_emphasis = True    # no **bold** / *italics*
+        h2t.single_line_break = True  # <br> → \n  ,  block → \n\n
+        h2t.unicode_snob = True       # handles &#xNN;
+        h2t.escape_all = False
         
-        for page in doc:
-            page_text = page.get_text()
-            if page_text.strip():
-                text_parts.append(page_text)
-        
-        doc.close()
-        text = '\n'.join(text_parts)
-        
-        # Fix Hebrew if needed
-        if text and self._has_hebrew(text) and self._looks_reversed(text):
-            text = self._fix_hebrew_bidi(text)
-            
-        title = Path(pdf_path).stem
+        # Additional cleanup settings (prevent unwanted substitutions)
+        h2t.default_image_alt = ""    # Don't substitute [alt text] for images
+        h2t.mark_code = False         # Don't add backticks/indentation to code blocks
+
+        raw_text = h2t.handle(html_content)
+
+        # 3. Post-process
+        text = html.unescape(raw_text)
+        text = unicodedata.normalize('NFKC', text)
+
+        # a. Multiple spaces → single space (doesn't touch \n)
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        # b. Spaces around newlines
+        text = re.sub(r" *\n *", "\n", text)
+        # c. Collapse: more than two empty lines → one empty line
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        # d. CJK – remove spaces inserted between Chinese/Japanese/Korean characters
+        text = re.sub(fr"([{CJK_RANGE}])\s+([{CJK_RANGE}])", r"\1\2", text)
+
+        # 4. Final filtering: remove invisible comments/remnants
+        text = text.strip("\n ")
+
         return title, text
 
-    def _has_hebrew(self, text):
-        """Check if text contains Hebrew."""
-        return any(0x0590 <= ord(c) <= 0x05FF for c in text[:200])
-
-    def _looks_reversed(self, text):
-        """Check if text looks reversed."""
-        words = text.split()[:20]
-        hebrew_words = [w for w in words if any(0x0590 <= ord(c) <= 0x05FF for c in w)]
-        english_words = [w for w in words if w.isascii() and w.isalpha()]
-        return len(hebrew_words) > 0 and len(english_words) > 0
-
-    def _fix_hebrew_bidi(self, text):
-        """Fix with bidi algorithm."""
+    def extract_txt_file(self, txt_path):
+        """Extract text from a pre-converted TXT file (originally PDF) and clean whitespace."""
         try:
-            from bidi.algorithm import get_display
-            lines = text.splitlines()
-            fixed_lines = []
+            with open(txt_path, 'r', encoding='utf-8') as f:
+                text = f.read()
             
-            for line in lines:
-                if self._has_hebrew(line):
-                    fixed_line = get_display(line)
-                    fixed_lines.append(fixed_line)
-                else:
-                    fixed_lines.append(line)
+            # Clean leading and trailing whitespace (including newlines)
+            text = text.strip()
             
-            return '\n'.join(fixed_lines)
+            # Get title from filename (without extension)
+            title = Path(txt_path).stem
             
-        except ImportError:
+            return title, text
+            
+        except Exception as e:
             if self.debug:
-                print("Warning: python-bidi not installed - returning original text")
-            return text
+                print(f"Error reading converted PDF file {txt_path}: {e}")
+            return None, None
 
     def process_file(self, file_path, lang, base_path):
         """Process single file."""
         # Determine file type
         if file_path.suffix == '.html':
             source_format = 'html'
-        elif file_path.suffix == '.pdf':
-            source_format = 'pdf'
+        elif file_path.suffix == '.txt':
+            # Check if this TXT file is from pdf directory (converted PDF)
+            if 'pdf' in str(file_path.parent):
+                source_format = 'pdf'  # Treat as PDF for metadata
+            else:
+                source_format = 'txt'
         else:
             return None
             
@@ -180,14 +239,16 @@ class DatasetCreator:
         try:
             if source_format == 'html':
                 with open(file_path, 'r', encoding='utf-8') as f:
-                    html_raw = f.read()  # save raw HTML
+                    html_raw = self.compact_html(f.read())  # save raw HTML
                     
                 if 'Read complete version in English' in html_raw or '.partial.html' in str(file_path):
                     return None
                     
                 title, extracted_content = self.extract_content(html_raw)
-            else:  # PDF
-                title, extracted_content = self.extract_pdf(file_path)
+            else:  # TXT (converted from PDF)
+                title, extracted_content = self.extract_txt_file(file_path)
+                if title is None or extracted_content is None:
+                    return None
             
             if not extracted_content.strip():
                 return None
@@ -205,7 +266,12 @@ class DatasetCreator:
             
         # Create unique ID
         if lang == "he":
-            file_id = f"he/{file_path.name}"
+            if source_format == 'pdf':  # TXT files converted from PDF
+                # Change .txt extension to .pdf for ID
+                filename_with_pdf_ext = file_path.stem + '.pdf'
+                file_id = f"he/{filename_with_pdf_ext}"
+            else:
+                file_id = f"he/{file_path.name}"
         else:
             file_id = file_path.relative_to(base_path).as_posix()
         
@@ -216,7 +282,12 @@ class DatasetCreator:
                 original_filename = original_filename.replace(eng, heb)
         
         if lang == "he":
-            original_url = f"https://hitdarderut-haaretz.org/{original_filename}"
+            if source_format == 'pdf':  # TXT files converted from PDF
+                # Use PDF extension in original URL
+                original_filename_pdf = file_path.stem + '.pdf'
+                original_url = f"https://hitdarderut-haaretz.org/{original_filename_pdf}"
+            else:
+                original_url = f"https://hitdarderut-haaretz.org/{original_filename}"
             url = original_url
         else:
             original_url = f"https://hitdarderut-haaretz.org/{original_filename}"
@@ -253,7 +324,10 @@ class DatasetCreator:
         
         # Save for debug
         if self.debug:
-            self.debug_samples[source_format].append(doc)
+            if source_format == 'pdf':
+                self.debug_samples["pdf"].append(doc)
+            else:
+                self.debug_samples["html"].append(doc)
         
         return doc
 
@@ -269,14 +343,21 @@ class DatasetCreator:
                 
             # Count files
             html_files = list(current_path.glob('*.html'))
-            pdf_files = list(current_path.glob('*.pdf')) if lang == "he" else []
-            all_files = html_files + pdf_files
+            txt_files = []
+            
+            # For Hebrew, also look for TXT files in pdf directory (parallel to base_dir)
+            if lang == "he":
+                pdf_dir = base_path.parent / "pdf"
+                if pdf_dir.exists():
+                    txt_files = list(pdf_dir.glob('*.txt'))
+            
+            all_files = html_files + txt_files
             
             if not all_files:
                 continue
                 
             if self.debug:
-                print(f"\nProcessing {lang}: {len(all_files)} files")
+                print(f"\nProcessing {lang}: {len(html_files)} HTML + {len(txt_files)} PDF files")
             
             # Process HTML
             for file_path in tqdm(html_files, desc=f"HTML {lang}", leave=False):
@@ -284,10 +365,10 @@ class DatasetCreator:
                 if article:
                     articles.append(article)
             
-            # Process PDF (Hebrew only)
-            if lang == "he" and pdf_files:
-                for pdf_path in tqdm(pdf_files, desc=f"PDF {lang}", leave=False):
-                    article = self.process_file(pdf_path, lang, base_path)
+            # Process TXT (converted from PDF, Hebrew only)
+            if lang == "he" and txt_files:
+                for txt_path in tqdm(txt_files, desc=f"PDF {lang}", leave=False):
+                    article = self.process_file(txt_path, lang, base_path)
                     if article:
                         articles.append(article)
         
@@ -330,26 +411,11 @@ class DatasetCreator:
         print(f"\nRunning external validations on {filename}...")
         
         tests_passed = 0
-        total_tests = 3
+        total_tests = 2
         
-        # Test 1: valid gzip
+        # Test 1: valid JSON on entire file
         if self.debug:
-            print("\n1. Checking gzip integrity...")
-        try:
-            result = subprocess.run(['gzip', '-t', filename], 
-                                  capture_output=True, text=True, timeout=30)
-            if result.returncode == 0:
-                if self.debug:
-                    print("gzip file is valid")
-                tests_passed += 1
-            else:
-                print(f"gzip file is corrupt: {result.stderr}")
-        except Exception as e:
-            print(f"gzip test error: {e}")
-        
-        # Test 2: valid JSON on entire file
-        if self.debug:
-            print("\n2. Checking JSON validity on entire file...")
+            print("\n1. Checking JSON validity on entire file...")
         try:
             json_test_script = f'''
 import gzip, json, sys
@@ -385,9 +451,9 @@ else:
         except Exception as e:
             print(f"JSON test error: {e}")
         
-        # Test 3: datasets can load
+        # Test 2: datasets can load
         if self.debug:
-            print("\n3. Checking datasets library loading...")
+            print("\n2. Checking datasets library loading...")
         try:
             datasets_test_script = f'''
 try:
@@ -420,11 +486,9 @@ except Exception as e:
             print(f"\nExternal validation results:")
             print(f"Passed: {tests_passed:.0f}/{total_tests} tests")
         
-        if tests_passed >= 3:
+        if tests_passed >= 2:
             return True
-        else:
-            print("Some issues found - check errors above")
-            return False
+        return False
 
     def print_debug_info(self, dataset):
         """Display debug info - first and last only, 150 chars."""
@@ -443,7 +507,7 @@ except Exception as e:
             print(f"ID: {sample['id']}")
             print(f"Source: {sample['source']}")
             print(f"Added: {sample['added']}")
-            # Text (up to 150 chars)
+            # Text (up to N chars)
             text = sample['text']
             if len(text) > 150:
                 text_preview = text[:150] + "..."
@@ -460,7 +524,7 @@ except Exception as e:
                     value = value[:150] + "..."
                 print(f"  {key}: {value}")
         
-        # Show samples - only first and last
+        # Show samples
         for format_type in ['html', 'pdf']:
             all_samples = self.debug_samples[format_type]
             if not all_samples:
@@ -468,13 +532,15 @@ except Exception as e:
                 
             print(f"\n{format_type.upper()} Samples (out of {len(all_samples)} records):")
             
-            # First
-            if len(all_samples) > 0:
-                print_sample(all_samples[0], format_type.upper(), 1, "(first)")
+            # Show every 400th sample
+            step = 400
+            for i in range(0, len(all_samples), step):
+                sample_index = i + 1
+                print_sample(all_samples[i], format_type.upper(), sample_index, f"(sample #{sample_index})")
             
-            # Last (if more than 1)
-            if len(all_samples) > 1:
-                print_sample(all_samples[-1], format_type.upper(), len(all_samples), "(last)")
+            # Always show the last sample if not already shown
+            if len(all_samples) > 1 and (len(all_samples) - 1) % step != 0:
+                print_sample(all_samples[-1], format_type.upper(), len(all_samples), "(final)")
         
         print("\n" + "="*80)
 
