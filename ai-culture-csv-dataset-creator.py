@@ -49,7 +49,7 @@ class DatasetCreator:
         del control_chars[0x0A]  # line feed
         del control_chars[0x0D]  # carriage return
         
-        return text.translate(control_chars)
+        return text.translate(control_chars).strip()
 
     def compact_html(self, raw):
         """
@@ -113,6 +113,9 @@ class DatasetCreator:
         title = soup.title.get_text(strip=True) if soup.title else ""
         title = unicodedata.normalize('NFKC', html.unescape(title))
 
+        # Add line break between divs for proper paragraph spacing
+        html_content = re.sub(r'</div>', '</div><br>', html_content)
+
         # 2. html2text – body text extraction
         h2t = html2text.HTML2Text()
         h2t.body_width = 0            # no hard-wrap
@@ -143,9 +146,6 @@ class DatasetCreator:
         # d. CJK – remove spaces inserted between Chinese/Japanese/Korean characters
         text = re.sub(fr"([{CJK_RANGE}])\s+([{CJK_RANGE}])", r"\1\2", text)
 
-        # 4. Final filtering: remove invisible comments/remnants
-        text = text.strip("\n ")
-
         return title, text
 
     def get_hebrew_content(self, file_name, base_dir):
@@ -173,6 +173,7 @@ class DatasetCreator:
         
         # Apply same processing as other formats
         content = self.compact_html(content)
+        content = content.replace('<html dir="ltr" lang="">', '<html dir="rtl" lang="he">')
         _, clean_text = self.extract_content(content)
         
         return hebrew_name, content, clean_text
@@ -278,8 +279,8 @@ class DatasetCreator:
                             break
                     
                     # Create URLs
-                    source_url = f"https://hitdarderut-haaretz.org/{hebrew_name}"
-                    translated_url = f"https://degeneration-of-nation.org/{lang}/{file_path.name}"
+                    source_url = f"https://hitdarderut-haaretz.org/{'' if hebrew_name.endswith('index.html') else hebrew_name[:-5]}"
+                    translated_url = f"https://degeneration-of-nation.org/{lang}/{'' if article_code.endswith('index') else article_code}"
                     
                     # Write row
                     writer.writerow([

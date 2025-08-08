@@ -22,7 +22,7 @@ class DatasetCreator:
             "bikoret-haaretz": "press-review",
             "tzurat-atid": "future-tense",
             "handasat-enosh": "human-engineering",
-            "acharrit-halelot": "end-of-nights",
+            "acharit-halelot": "end-of-nights",
             "hapostim-shel-hashavua": "posts-of-the-week"
         }
         
@@ -45,6 +45,22 @@ class DatasetCreator:
         # Debug samples
         self.debug_samples = {"html": [], "pdf": []}
 
+    def clean_url_path(self, filename, for_index_special=True):
+        """Clean URL path - remove .html and handle index.html specially"""
+        if filename == 'index.html' and for_index_special:
+            return ''
+        elif filename.endswith('.html'):
+            return filename[:-5]
+        else:
+            return filename
+
+    def build_url(self, base_url, clean_path):
+        """Build URL with proper trailing slash for empty paths"""
+        if not clean_path:
+            return base_url.rstrip('/') + '/'
+        else:
+            return f"{base_url.rstrip('/')}/{clean_path}"
+        
     def get_domain(self, file_path, source_format, lang):
         """Determine category by filename or directory."""
         if source_format == 'pdf':
@@ -102,7 +118,7 @@ class DatasetCreator:
         del control_chars[0x0A]  # line feed
         del control_chars[0x0D]  # carriage return
         
-        return text.translate(control_chars)
+        return text.translate(control_chars).strip()
 
     def compact_html(self, raw):
         """
@@ -166,6 +182,9 @@ class DatasetCreator:
         title = soup.title.get_text(strip=True) if soup.title else ""
         title = unicodedata.normalize('NFKC', html.unescape(title))
 
+        # Add line break between divs for proper paragraph spacing
+        html_content = re.sub(r'</div>', '</div><br>', html_content)
+
         # 2. html2text – body text extraction
         h2t = html2text.HTML2Text()
         h2t.body_width = 0            # no hard-wrap
@@ -195,9 +214,6 @@ class DatasetCreator:
         text = re.sub(r"\n{3,}", "\n\n", text)
         # d. CJK – remove spaces inserted between Chinese/Japanese/Korean characters
         text = re.sub(fr"([{CJK_RANGE}])\s+([{CJK_RANGE}])", r"\1\2", text)
-
-        # 4. Final filtering: remove invisible comments/remnants
-        text = text.strip("\n ")
 
         return title, text
 
@@ -240,7 +256,10 @@ class DatasetCreator:
             if source_format == 'html':
                 with open(file_path, 'r', encoding='utf-8') as f:
                     html_raw = self.compact_html(f.read())  # save raw HTML
-                    
+                # Fix Hebrew HTML direction and language
+                if lang == "he":
+                    html_raw = html_raw.replace('<html dir="ltr" lang="">', '<html dir="rtl" lang="he">')  
+                                      
                 if 'Read complete version in English' in html_raw or '.partial.html' in str(file_path):
                     return None
                     
@@ -271,9 +290,15 @@ class DatasetCreator:
                 filename_with_pdf_ext = file_path.stem + '.pdf'
                 file_id = f"he/{filename_with_pdf_ext}"
             else:
-                file_id = f"he/{file_path.name}"
+                clean_filename = self.clean_url_path(file_path.name)
+                file_id = f"he/{clean_filename}" if clean_filename else "he"
         else:
-            file_id = file_path.relative_to(base_path).as_posix()
+            file_relative = file_path.relative_to(base_path).as_posix()
+            if file_path.name == 'index.html':
+                file_id = str(file_path.parent.relative_to(base_path))
+            else:
+                clean_relative = self.clean_url_path(file_relative)
+                file_id = clean_relative
         
         # URLs
         original_filename = file_path.name
@@ -287,11 +312,18 @@ class DatasetCreator:
                 original_filename_pdf = file_path.stem + '.pdf'
                 original_url = f"https://hitdarderut-haaretz.org/{original_filename_pdf}"
             else:
-                original_url = f"https://hitdarderut-haaretz.org/{original_filename}"
+                clean_orig = self.clean_url_path(original_filename)
+                original_url = self.build_url("https://hitdarderut-haaretz.org", clean_orig)
             url = original_url
         else:
-            original_url = f"https://hitdarderut-haaretz.org/{original_filename}"
-            url = f"https://degeneration-of-nation.org/{file_path.relative_to(base_path).as_posix()}"
+            clean_orig = self.clean_url_path(original_filename)
+            original_url = self.build_url("https://hitdarderut-haaretz.org", clean_orig)
+            
+            if file_path.name == 'index.html':
+                url = self.build_url("https://degeneration-of-nation.org", str(file_path.parent.relative_to(base_path)))
+            else:
+                clean_file_relative = self.clean_url_path(file_path.relative_to(base_path).as_posix())
+                url = self.build_url("https://degeneration-of-nation.org", clean_file_relative)
         
         # Calculate fields - with smart word counting
         wc = self.count_words_smart(extracted_content, lang)

@@ -36,7 +36,7 @@ class DatasetCreator:
         del control_chars[0x0A]  # line feed
         del control_chars[0x0D]  # carriage return
         
-        return text.translate(control_chars)
+        return text.translate(control_chars).strip()
 
     def compact_html(self, raw):
         """
@@ -100,6 +100,9 @@ class DatasetCreator:
         title = soup.title.get_text(strip=True) if soup.title else ""
         title = unicodedata.normalize('NFKC', html.unescape(title))
 
+        # Add line break between divs for proper paragraph spacing
+        html_content = re.sub(r'</div>', '</div><br>', html_content)
+
         # 2. html2text – body text extraction
         h2t = html2text.HTML2Text()
         h2t.body_width = 0            # no hard-wrap
@@ -129,10 +132,7 @@ class DatasetCreator:
         text = re.sub(r"\n{3,}", "\n\n", text)
         # d. CJK – remove spaces inserted between Chinese/Japanese/Korean characters
         text = re.sub(fr"([{CJK_RANGE}])\s+([{CJK_RANGE}])", r"\1\2", text)
-
-        # 4. Final filtering: remove invisible comments/remnants
-        text = text.strip("\n ")
-
+        
         return title, text
 
     def process_file(self, file_path, lang):
@@ -142,24 +142,30 @@ class DatasetCreator:
             
         with open(file_path, 'r', encoding='utf-8') as f:
             content = self.compact_html(f.read())
-            
+
+        if lang == "he":
+            content = content.replace('<html dir="ltr" lang="">', '<html dir="rtl" lang="he">')
+
         # Skip partial translations files
         if 'Read complete version in English' in content or '.partial.html' in str(file_path):
             return None
             
         # Create file identifier
-        relative_path = file_path.name
+        relative_path = file_path.name[:-5]
         file_id = f"{lang}/{relative_path}"
-        
+        if relative_path.endswith("index"):
+            relative_path = ""
+            print("Language: " + lang)
+
         # Convert English path to Hebrew if needed
         original_path = relative_path
         if lang != "he":
             for heb, eng in self.hebrew_to_english_paths.items():
                 original_path = original_path.replace(eng, heb)
-        
+
         # Generate URLs
         original_url = f"https://hitdarderut-haaretz.org/{original_path}"
-        url = original_url if lang == "he" else f"https://degeneration-of-nation.org/{file_id}"
+        url = original_url if lang == "he" else f"https://degeneration-of-nation.org/{lang}/{relative_path}"
         
         title, extracted_content = self.extract_content(content)
         
