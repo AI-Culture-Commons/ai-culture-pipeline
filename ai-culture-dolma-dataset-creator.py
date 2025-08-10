@@ -248,10 +248,10 @@ class DatasetCreator:
             else:
                 source_format = 'txt'
         else:
-            return None
+            return file_path.suffix[1:]
             
         # Extract content
-        html_raw = None  # only for HTML
+        html_raw = ""  # only for HTML
         try:
             if source_format == 'html':
                 with open(file_path, 'r', encoding='utf-8') as f:
@@ -261,21 +261,21 @@ class DatasetCreator:
                     html_raw = html_raw.replace('<html dir="ltr" lang="">', '<html dir="rtl" lang="he">')  
                                       
                 if 'Read complete version in English' in html_raw or '.partial.html' in str(file_path):
-                    return None
+                    return ""
                     
                 title, extracted_content = self.extract_content(html_raw)
             else:  # TXT (converted from PDF)
                 title, extracted_content = self.extract_txt_file(file_path)
                 if title is None or extracted_content is None:
-                    return None
+                    return ""
             
             if not extracted_content.strip():
-                return None
+                return ""
                 
         except Exception as e:
             if self.debug:
                 print(f"Error processing {file_path}: {e}")
-            return None
+            return ""
             
         # Clean control chars before creating record
         title = self.clean_control_chars(title)
@@ -336,7 +336,7 @@ class DatasetCreator:
             "language": lang,
             "title": title,
             "url": url,
-            "translation_of": original_url if lang != "he" else None,
+            "translation_of": original_url if lang != "he" else "",
             "source_format": source_format,
             "domain": domain,
             "license": "CC-BY-4.0",
